@@ -1,0 +1,180 @@
+#!/usr/bin/python
+"""
+Author: Sravan Kumar Tammineni
+Nagios-flink-plugin for monitoring job status, exceptions, checkpoint status and back pressure from API
+Tested on Centos
+"""
+import os
+import sys
+import argparse
+import re
+import urllib2
+import json
+import base64
+import requests
+import time
+
+nagios_codes = {
+    'OK': 0,
+    'WARNING': 1,
+    'CRITICAL': 2,
+    'UNKNOWN': 3,
+}
+
+def get_data(mainurl, username, password, suburl):
+    try:
+        url_request = urllib2.Request("{0}/{1}".format(mainurl,suburl))
+        base64string = base64.encodestring('%s:%s' % (username, password)).replace('\n', '')
+        url_request.add_header("Authorization", "Basic %s" % base64string)
+        url_response = urllib2.urlopen(url_request, timeout = 10)
+        url = url_response.geturl()
+        request = urllib2.Request("{0}".format(url))
+        base64string = base64.encodestring('%s:%s' % (username, password)).replace('\n', '')
+        request.add_header("Authorization", "Basic %s" % base64string)
+        response = urllib2.urlopen(request, timeout = 10)
+        data = json.loads(response.read())
+        return data
+
+    except:
+        return "UnableToGetData"
+
+def job_status(mainurl, username, password, jobname):
+    suburl = "/joboverview/running"
+    job_id = ""
+    count = 0
+    data = get_data(mainurl, username, password, suburl)
+    if data != "UnableToGetData":
+        for key in data['jobs']:
+        if key['name'] == jobname:
+        count = count + 1
+    if count == 0:
+           print "CRITICAL - No " + jobname + " consumer found running"
+           sys.exit(nagios_codes['CRITICAL'])
+    elif count > 1:
+           print "CRITICAL - Multiple " + jobname + " consumers found running"
+           sys.exit(nagios_codes['CRITICAL'])
+    else:
+       for key in data['jobs']:
+               while key['name'] == jobname:
+                   job_id = key['jid']
+                   job_state = key['state']
+                   break
+           if job_state == "RUNNING":
+              status = "OK - {0} job is in {1} state. Job ID: {2}".format(jobname,job_state,job_id)
+              return "OK", job_id, status
+           else:
+              status = "WARNING - {0} job is in {1} state. Job ID: {2}".format(jobname,job_state,job_id)
+              return "WARNING", job_id, status
+    else:
+        print "UNKNOWN - Unable to get data from Flink API"
+        sys.exit(nagios_codes['UNKNOWN'])
+
+def checkpoint_status(mainurl, username, password, job_id, checkpoint_threshold):
+    suburl = ''.join(['/jobs/', job_id, '/checkpoints'])
+    data = get_data(mainurl, username, password, suburl)
+    if data != "UnableToGetData":
+        fail_percentage = (float(data['counts']['failed'])/float(data['counts']['total'])) * 100
+        if fail_percentage < checkpoint_threshold:
+            status = "OK - Checkpoint Status - Total: {0}, Completed: {1}, Failed: {2}".format(data['counts']['total'],data['counts']['completed'],data['counts']['failed'])
+            return "OK", status
+        else:
+            status = "WARNING - Checkpoint Status - Total: {0}, Completed: {1}, Failed: {2}".format(data['counts']['total'],data['counts']['completed'],data['counts']['failed'])
+            return "WARNING", status
+    else:
+        status = "Unable to get data from Flink checkpoint API"
+        return "UNKNOWN", status  
+
+def back_pressure_status(mainurl, username, password, job_id):
+    suburl = ''.join(['/jobs/', job_id])
+    data = get_data(mainurl, username, password, suburl)
+    if data != "UnableToGetData":
+        vertexid = data['vertices'][0]['id']
+        suburl = ''.join(['/jobs/', job_id, '/vertices/', vertexid, '/backpressure'])
+        data = get_data(mainurl, username, password, suburl)
+        if data != "UnableToGetData":
+            timeout = time.time() + 10
+            while data['status'] == "deprecated":
+                data = get_data(mainurl, username, password, suburl)
+                if time.time() > timeout:
+                    break
+            if (data['status'] == "ok" and data['backpressure-level'] == "ok"):
+                status = "OK - Back-Pressure - Status: {0}, Level: {1}".format(data['status'],data['backpressure-level'])
+                return "OK", status
+            else:
+                status = "WARNING - Back-Pressure - Status: {0}, Level: {1}".format(data['status'],data['backpressure-level'])
+                return "WARNING", status
+        else:
+            status = "Unable to get data from Flink Consumer Back-Pressure API"
+            return "UNKNOWN", status
+    else:
+        status = "Unable to get data from Flink job details API"
+        return "UNKNOWN", status         
+
+def exception_status(mainurl, username, password, job_id, exception_threshold):
+    suburl = ''.join(['/jobs/', job_id, '/exceptions'])
+    data = get_data(mainurl, username, password, suburl)
+    if data != "UnableToGetData":
+        no_of_exceptions = len(data['all-exceptions'])
+        if no_of_exceptions > exception_threshold:
+            status = "WARNING - Total number of exceptions: {0}".format(no_of_exceptions)
+            return "WARNING", status
+        else:
+            status = "OK - Total number of exceptions: {0}".format(no_of_exceptions)
+            return "OK", status
+    else:
+        status = "Unable to get data from Flink exceptions API"
+        return "UNKNOWN", status
+
+def overall_status(mainurl, username, password, jobname):
+    level = []
+    status = []
+    result, job_id, output = job_status(mainurl, username, password, jobname)
+    level.append(result)
+    status.append(output)
+    result, output = checkpoint_status(mainurl, username, password, job_id, checkpoint_threshold)
+    level.append(result)
+    status.append(output)
+    result, output = back_pressure_status(mainurl, username, password, job_id)
+    level.append(result)
+    status.append(output)
+    result, output = exception_status(mainurl, username, password, job_id, exception_threshold)
+    level.append(result)
+    status.append(output)
+
+    if (all(c == 'OK' for c in level)):
+        print "OK - {0} consumer is healthy".format(jobname)
+        print '\n'.join(status)
+        sys.exit(nagios_codes['OK'])
+    elif (any(c == 'WARNING' for c in level)):
+        print "WARNING - {0} consumer is not healthy".format(jobname)
+        print '\n'.join(status)
+        sys.exit(nagios_codes['WARNING'])
+    else:
+        print "UNKNOWN - Status Unknown"
+        print '\n'.join(status)
+        sys.exit(nagios_codes['UNKNOWN'])
+
+if __name__ == '__main__':
+    try:
+        parser = argparse.ArgumentParser(description='check flink job status, exceptions, checkpoint status and consumer back pressure')
+        required = parser.add_argument_group('required arguments')
+        optional = parser.add_argument_group('optional arguments')
+        required.add_argument('-u','--username', help="username for flink web", required=True)
+        required.add_argument('-p','--password', help="password for flink web", required=True)
+        required.add_argument('-j','--job_name', help="consumer job name", required=True)
+        optional.add_argument('-P','--port', help="port number", default="8082")
+        optional.add_argument('-e','--exception_threshold', help="threshold count level for exceptions", default='3')
+        optional.add_argument('-c','--checkpoint_threshold', help="threshold percentage level for checkpoint failures", default='25')
+        args = parser.parse_args()
+        username = args.username
+        password = args.password
+        jobname = args.job_name
+        exception_threshold = args.exception_threshold
+        checkpoint_threshold = args.checkpoint_threshold
+        host = os.uname()[1]
+        port = args.port
+        mainurl = ''.join(['http://', host, ':', port])
+        overall_status(mainurl, username, password, jobname)
+    except KeyboardInterrupt:
+        print 'Ctrl^C Caught! Exiting...'
+        sys.exit(-1)
